@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 import json
 import time
+from pathlib import Path
 # Import necessary functions from webrover.py
 from .webrover import setup_browser_2, main_agent_graph
 
@@ -28,6 +29,7 @@ app.add_middleware(
 browser_session: Dict[str, Any] = {
     "playwright": None,
     "browser": None,
+    "context": None,
     "page": None
 }
 
@@ -47,13 +49,33 @@ async def setup_browser(request: BrowserSetupRequest):
         if browser_session["playwright"]:
             await cleanup_browser()
             
-        # Setup new browser session
+        # Setup new browser session with a context
         playwright, browser, page = await setup_browser_2(request.url)
+        context = page.context
+        
+        # Load and set cookies from linkedin_cookies.json if it exists
+        cookies_path = Path(__file__).parent / "cookies.json"  # Use correct path
+        if cookies_path.exists():
+            try:
+                with open(cookies_path, 'r') as f:
+                    cookies = json.load(f)
+                # Add cookies to the context
+                await context.add_cookies(cookies)
+                # Verify cookies were set
+                current_cookies = await context.cookies()
+                print(f"Loaded {len(current_cookies)} cookies")
+                print("Current cookies:", current_cookies)
+            except Exception as e:
+                print(f"Error loading cookies: {str(e)}")
+                print(f"Cookies path: {cookies_path}")  # Debug print
+        else:
+            print(f"Cookies file not found at: {cookies_path}")  # Debug print
         
         # Store session info
         browser_session.update({
             "playwright": playwright,
             "browser": browser,
+            "context": context,
             "page": page
         })
         
@@ -66,6 +88,8 @@ async def cleanup_browser():
     try:
         if browser_session["page"]:
             await browser_session["page"].close()
+        if browser_session["context"]:
+            await browser_session["context"].close()
         if browser_session["browser"]:
             await browser_session["browser"].close()
         if browser_session["playwright"]:
@@ -75,6 +99,7 @@ async def cleanup_browser():
         browser_session.update({
             "playwright": None,
             "browser": None,
+            "context": None,
             "page": None
         })
         

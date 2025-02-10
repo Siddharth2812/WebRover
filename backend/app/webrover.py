@@ -16,7 +16,7 @@ import io
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 import platform
-from IPython.display import Image, display
+# from IPython.display import Image, display
 from langgraph.graph import StateGraph, START, END
 
 

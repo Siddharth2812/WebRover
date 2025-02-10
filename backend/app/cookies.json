@@ -1,0 +1,20 @@
+[{
+    "name": "li_at",
+    "value": "AQEDATfpgSkFm5uIAAABlOJmy9MAAAGVBnNP01YAsL69qFRp7ZBtaQPxtZ0iOc6zbX0LZ9IO5PNO9Guk2CIHoKpQneNYxqZpD7ycbnBn7BVhAOUM_1yUcD_iT96EpVp2p0kSVdS9SuKcqiIs5lviO5xp",
+    "domain": ".www.linkedin.com",
+    "path": "/",
+    "expires": 1770501175.49416,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+},    {
+    "name": "JSESSIONID",
+    "value": "\"ajax:3955586980334145315\"",
+    "domain": ".www.linkedin.com",
+    "path": "/",
+    "expires": 1746741175.494187,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+}
+]
