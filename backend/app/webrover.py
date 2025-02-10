@@ -3,7 +3,7 @@ from langchain_openai import ChatOpenAI
 #from langchain_anthropic import ChatAnthropic
 import os
 #import nest_asyncio
-from typing import TypedDict, List, Annotated
+from typing import TypedDict, List, Annotated, Optional, Dict, Type
 from playwright.async_api import Page
 from langchain_core.messages import BaseMessage
 from operator import add
@@ -18,6 +18,10 @@ from langchain_core.prompts import ChatPromptTemplate
 import platform
 # from IPython.display import Image, display
 from langgraph.graph import StateGraph, START, END
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -77,6 +81,10 @@ class AgentState(TypedDict):
     last_action: str
     notes: Annotated[List[str], add]
     answer: str
+    sensitive_data: Optional[Dict[str, str]]
+    use_vision: bool
+    ratio_width: int = 1076
+    ratio_height: int = 1076
 
 
 
@@ -114,19 +122,23 @@ async def capture_screenshot(page: Page, max_retries=3, wait_seconds=2) -> bytes
     return screenshot_bytes  # Return whatever we got last
 
 
-async def mark_page(page):
+async def mark_page(state: AgentState, max_retries=3, wait_seconds=2) -> dict:
+    page = state["page"]
+    ratio_width = state["ratio_width"]
+    ratio_height = state["ratio_height"]
+    use_vision = state["use_vision"]
 
-    """
-    1. Wait for the page to be loaded using 'networkidle'.
-    2. Attempt to run a 'mark_page_script' that presumably marks and returns bounding boxes.
-    3. Retry up to 10 times if it fails.
-    4. Capture a screenshot with retry logic (up to 3 tries) if the page is blank.
-    5. Process screenshot (grayscale, resize, quantize, compress).
-    6. Remove the markings before returning.
-    """
+    # Apply custom viewport size
+    await page.set_viewport_size({"width": ratio_width, "height": ratio_height})
+
+    if not use_vision:
+        return {
+            "image": "",
+            "bboxes": []
+        }
 
     bboxes = []
-
+    
     for attempt in range (3):
         
         try: 
@@ -175,7 +187,9 @@ async def mark_page(page):
     except Exception as e:
         print(f"[mark_page] Could not unmark page: {e}")
 
-    # Build final result
+    # Reset viewport before returning
+    await page.set_viewport_size({"width": 1076, "height": 1076})
+
     return {
         "image": base64.b64encode(compressed_bytes).decode("utf-8"),
         "bboxes": bboxes
@@ -232,144 +246,278 @@ async def setup_browser_2(go_to_page: str):
 
 
 
+class MessageMetadata(TypedDict):
+    input_tokens: int
+    timestamp: str = datetime.now().isoformat()
+
+class MessageHistory:
+    def __init__(self):
+        self.messages: List[BaseMessage] = []
+        self.total_tokens: int = 0
+    
+    def add_message(self, message: BaseMessage, metadata: MessageMetadata, position: Optional[int] = None) -> None:
+        if position is not None:
+            self.messages.insert(position, message)
+        else:
+            self.messages.append(message)
+        self.total_tokens += metadata.input_tokens
+    
+    def remove_message(self, index: int = -1) -> None:
+        if self.messages:
+            removed_message = self.messages.pop(index)
+            self.total_tokens -= getattr(removed_message, 'input_tokens', 0)
+
+
+def _filter_sensitive_data(text: str, sensitive_data: Dict[str, str]) -> str:
+    """Filter out sensitive data from the message"""
+    if not sensitive_data:
+        return text
+    filtered = text
+    for key, val in sensitive_data.items():
+        filtered = filtered.replace(val, f'<secret>{key}</secret>')
+    return filtered
+
+# Update MAX_PROMPT_TOKENS to match MessageManager's max_input_tokens
+MAX_PROMPT_TOKENS = 128000
+
 async def master_plan_node(state: AgentState):
+    try:
+        # Initialize ratio_width and ratio_height if not present
+        if "ratio_width" not in state:
+            state["ratio_width"] = 1076
+        if "ratio_height" not in state:
+            state["ratio_height"] = 1076
+        if "use_vision" not in state:
+            state["use_vision"] = True
 
-    screen_shot = await mark_page(state["page"])
-    
+        screen_shot = await mark_page(state)
+        
+        system_message = """
+        You are an expert a preparing a step by step plan to complete a task.
+        You will be given a task provided by the user. The task might also be a question.
+        You will need to prepare a plan to complete the task. In case its a question, you will need to prepare a plan to answer the question.
 
-    system_message = """
-    You are an expert a preparing a step by step plan to complete a task.
-    You will be given a task provided by the user. The task might also be a question.
-    You will need to prepare a plan to complete the task. In case its a question, you will need to prepare a plan to answer the question.
+        You will be also provided the screenshot of the current web page.
+        - If the current page is google home page or any other search engine, create a plan that basically searches the keyword and continues to the next step.
+        - If the current page is not a some other web page, create a plan to scroll through the page and relevant collect information. 
 
-    You will be also provided the screenshot of the current web page.
-    - If the current page is google home page or any other search engine, create a plan that basically searches the keyword and continues to the next step.
-    - If the current page is not a some other web page, create a plan to scroll through the page and relevant collect information. 
+        For eg if the task is "What is the lastest news on Apple's stock price?", you will need to prepare a plan to answer the question.
+        You will need to prepare a plan to complete the task.
 
-    For eg if the task is "What is the lastest news on Apple's stock price?", you will need to prepare a plan to answer the question.
-    You will need to prepare a plan to complete the task.
+        For example, if the task is "What is the latest news on Apple's stock price?", your plan might look like this:
+        1. Go to Google
+        2. Type "Apple stock price news today" in the search bar and press enter
+        3. Click on the link to the reliable financial news source (like Reuters, Bloomberg, or CNBC).
+        4. Scan the article for current stock price and recent developments
+        5. If you have enough information, prepare a concise summary of the latest news and price movement
+        6. If you do not have enough information, go back to the previous page and try a different source and collect more data until you have enough information to answer the question.
 
-    For example, if the task is "What is the latest news on Apple's stock price?", your plan might look like this:
-    1. Go to Google
-    2. Type "Apple stock price news today" in the search bar and press enter
-    3. Click on the link to the reliable financial news source (like Reuters, Bloomberg, or CNBC).
-    4. Scan the article for current stock price and recent developments
-    5. If you have enough information, prepare a concise summary of the latest news and price movement
-    6. If you do not have enough information, go back to the previous page and try a different source and collect more data until you have enough information to answer the question.
+        Your plan should be clear, sequential, and focused on achieving the user's goal efficiently. 
 
-    Your plan should be clear, sequential, and focused on achieving the user's goal efficiently. 
+        --Notes--
+        The browser is already open. First page will always be google, so plan accordingly with a search term.
+        For any question, you will need to go to google and search for the question.
+        """ 
 
-    --Notes--
-    The browser is already open. First page will always be google, so plan accordingly with a search term.
-    For any question, you will need to go to google and search for the question.
-    """ 
+        human_prompt = """ This is the task that needs to be performed/question that needs to be answered: {input} \n This is the screenshot of the current web page: {screenshot}"""
 
-    human_prompt = """ This is the task that needs to be performed/question that needs to be answered: {input} \n This is the screenshot of the current web page: {screenshot}"""
+        input = state["input"]
 
-    input = state["input"]
+        human_message = human_prompt.format(input=input, screenshot=screen_shot)
 
-    human_message = human_prompt.format(input=input, screenshot=screen_shot)
+        messages = [
+            SystemMessage(content=system_message),
+            HumanMessage(content=human_message)
+        ]
 
-    messages = [
-        SystemMessage(content=system_message),
-        HumanMessage(content=human_message)
-    ]
-    structured_llm = llm.with_structured_output(MasterPlanState)
+        # Count tokens for all messages
+        total_tokens = sum(_count_message_tokens(msg) for msg in messages)
+        print(f"Total tokens in master plan: {total_tokens}")
 
-    response = structured_llm.invoke(messages)
-    
+        if total_tokens > MAX_PROMPT_TOKENS:
+            print(f"Truncating master plan from {total_tokens} to {MAX_PROMPT_TOKENS} tokens")
+            try:
+                # Keep system message intact and truncate human message
+                system_tokens = _count_message_tokens(messages[0])
+                available_tokens = MAX_PROMPT_TOKENS - system_tokens
+                
+                if available_tokens > 0:
+                    # Truncate human message content
+                    human_content = human_message[:int(len(human_message) * (available_tokens / (total_tokens - system_tokens)))]
+                    messages = [
+                        SystemMessage(content=system_message),
+                        HumanMessage(content=human_content)
+                    ]
+                else:
+                    print("Warning: System message alone exceeds token limit")
+                    # If we must truncate system message
+                    truncated_system = system_message[:int(len(system_message) * (MAX_PROMPT_TOKENS / total_tokens))]
+                    messages = [SystemMessage(content=truncated_system)]
+            except Exception as e:
+                print(f"Error during master plan truncation: {str(e)}")
+                raise
 
-    return {"master_plan": [response]}
+        try:
+            structured_llm = llm.with_structured_output(MasterPlanState)
+            response = structured_llm.invoke(messages)
+        except Exception as e:
+            print(f"Error during master plan LLM call: {str(e)}")
+            raise
+        
+        return {"master_plan": [response]}
+    except Exception as e:
+        print(f"Critical error in master_plan_node: {str(e)}")
+        raise
 
+def _count_tokens(text: str, estimated_characters_per_token: int = 3) -> int:
+    """Count tokens in a text string using character estimation"""
+    return len(text) // estimated_characters_per_token
 
-
-async def annotate_page(state: AgentState):
-    page = state["page"]
-    result = await mark_page(page)
-    return {"image": result["image"], "bboxes": result["bboxes"]}
-
+def _count_message_tokens(message: BaseMessage, img_tokens: int = 800, estimated_characters_per_token: int = 3) -> int:
+    """Count tokens in a message including both text and images"""
+    tokens = 0
+    if isinstance(message.content, list):
+        for item in message.content:
+            if 'image_url' in item:
+                tokens += img_tokens
+            elif isinstance(item, dict) and 'text' in item:
+                tokens += _count_tokens(item['text'], estimated_characters_per_token)
+    else:
+        msg = message.content
+        if hasattr(message, 'tool_calls'):
+            msg += str(message.tool_calls)  # type: ignore
+        tokens += _count_tokens(msg, estimated_characters_per_token)
+    return tokens
 
 async def llm_call_node(state: AgentState):   
+    try:
+        template = """Imagine you are a robot browsing the web, just like humans. Now you need to complete a task. In each iteration,
+        you will receive an Observation that includes a screenshot of a webpage and some texts. 
+        Carefully analyze the bounding box information and the web page contents to identify the Numerical Label corresponding 
+        to the Web Element that requires interaction, then follow
+        the guidelines and choose one of the following actions:
 
-    template =  """Imagine you are a robot browsing the web, just like humans. Now you need to complete a task. In each iteration,
-    you will receive an Observation that includes a screenshot of a webpage and some texts. 
-    Carefully analyze the bounding box information and the web page contents to identify the Numerical Label corresponding 
-    to the Web Element that requires interaction, then follow
-    the guidelines and choose one of the following actions:
+        1. Click a Web Element.
+        2. Delete existing content in a textbox and then type content.
+        3. Scroll up or down.
+        4. Wait 
+        5. Go back
+        7. Return to google to start over.
+        8. Respond with the final answer
 
-    1. Click a Web Element.
-    2. Delete existing content in a textbox and then type content.
-    3. Scroll up or down.
-    4. Wait 
-    5. Go back
-    7. Return to google to start over.
-    8. Respond with the final answer
+        Correspondingly, Action should STRICTLY follow the format:
 
-    Correspondingly, Action should STRICTLY follow the format:
+        - Click [Numerical_Label] 
+        - Type [Numerical_Label]; [Content] 
+        - Scroll [Numerical_Label or WINDOW]; [up or down] 
+        - Wait 
+        - GoBack
+        - Google
+        - Respond 
 
-    - Click [Numerical_Label] 
-    - Type [Numerical_Label]; [Content] 
-    - Scroll [Numerical_Label or WINDOW]; [up or down] 
-    - Wait 
-    - GoBack
-    - Google
-    - Respond 
+        Key Guidelines You MUST follow:
 
-    Key Guidelines You MUST follow:
+        * Action guidelines *
+        1) Execute only one action per iteration.
+        2) Always click close on the popups.
+        3) When clicking or typing, ensure to select the correct bounding box.
+        4) Numeric labels lie in the top-left corner of their corresponding bounding boxes and are colored the same.
+        5) Try to scroll down if a pdf or a document is opeened to read the entire document., if you dont find the information you need, go back to the previous page and try a different source and collect more data until you have enough information to answer the question.
 
-    * Action guidelines *
-    1) Execute only one action per iteration.
-    2) Always click close on the popups.
-    3) When clicking or typing, ensure to select the correct bounding box.
-    4) Numeric labels lie in the top-left corner of their corresponding bounding boxes and are colored the same.
-    5) Try to scroll down if a pdf or a document is opeened to read the entire document., if you dont find the information you need, go back to the previous page and try a different source and collect more data until you have enough information to answer the question.
+        * Web Browsing Guidelines *
+        1) Don't interact with useless web elements like Login, Sign-in, donation that appear in Webpages
+        2) Select strategically to minimize time wasted.
 
-    * Web Browsing Guidelines *
-    1) Don't interact with useless web elements like Login, Sign-in, donation that appear in Webpages
-    2) Select strategically to minimize time wasted.
+        Your reply should strictly follow the format:
+        Thought: {{Your brief thoughts (briefly summarize the info that will help ANSWER)}}
+        Action: {{One Action format you choose}} (Make sure to enclose the bbox id in [] , for eg  Click [1], Type [5], Scroll [10] or Scroll [WINDOW])
+        
+        Then the User will provide:
+        Observation: {{A labeled bounding boxes and contents given by User}}"
+        Actions Taken: {{A list of actions taken so far}} (Could be empty, if it is the first iteration)
+        Master Plan: {{A set of steps that you can use as a reference to complete the task}}
 
-    Your reply should strictly follow the format:
-    Thought: {{Your brief thoughts (briefly summarize the info that will help ANSWER)}}
-    Action: {{One Action format you choose}} (Make sure to enclose the bbox id in [] , for eg  Click [1], Type [5], Scroll [10] or Scroll [WINDOW])
-    
-    Then the User will provide:
-    Observation: {{A labeled bounding boxes and contents given by User}}"
-    Actions Taken: {{A list of actions taken so far}} (Could be empty, if it is the first iteration)
-    Master Plan: {{A set of steps that you can use as a reference to complete the task}}
-
-    Observation including a screenshot of a webpage with bounding boxes and the text related to it: {{result}}"""
+        Observation including a screenshot of a webpage with bounding boxes and the text related to it: {{result}}"""
 
 
 
-    prompt = ChatPromptTemplate(
-        messages=[
-            ("system", template),
-            ("human", "Input: {input}"),
-            ("human", "Actions Taken So far: {actions_taken}"),
-            ("human", "Observation: Screenshot: {image}"),
-            ("human", "Observation: Bounding Boxes: {bboxes}"),
-            
-        ],
-        input_variables=["image", "bboxes", "input"],
-        partial_variables={"actions_taken": []},
-        optional_variables=["actions_taken"]
-    )
-    
-    
+        prompt = ChatPromptTemplate(
+            messages=[
+                ("system", template),
+                ("human", "Input: {input}"),
+                ("human", "Actions Taken So far: {actions_taken}"),
+                ("human", "Observation: Screenshot: {image}"),
+                ("human", "Observation: Bounding Boxes: {bboxes}"),
+                
+            ],
+            input_variables=["image", "bboxes", "input"],
+            partial_variables={"actions_taken": []},
+            optional_variables=["actions_taken"]
+        )
+        
+        
 
-    actions_taken = state.get("actions_taken", [])
-    image = state["image"]
-    bboxes = state["bboxes"]
-    input = state["input"]
-    master_plan = state["master_plan"]
-    
-    prompt_value = prompt.invoke({"actions_taken": actions_taken, "image": image, "bboxes": bboxes, "input": input, "master_plan": master_plan})
-    
-    response = llm.invoke(prompt_value)
+        actions_taken = state.get("actions_taken", [])
+        image = state["image"]
+        bboxes = state["bboxes"]
+        input = state["input"]
+        master_plan = state["master_plan"]
+        sensitive_data = state.get("sensitive_data", {})
+        
+        if sensitive_data:
+            try:
+                image = _filter_sensitive_data(image, sensitive_data)
+                bboxes = _filter_sensitive_data(str(bboxes), sensitive_data)
+            except Exception as e:
+                print(f"Error filtering sensitive data: {str(e)}")
 
-    action = response.content
-    
-    return {"action": action}
+        try:
+            prompt_value = prompt.invoke({
+                "actions_taken": actions_taken, 
+                "image": image, 
+                "bboxes": bboxes, 
+                "input": input, 
+                "master_plan": master_plan
+            })
+        except Exception as e:
+            print(f"Error creating prompt: {str(e)}")
+            raise
+
+        # Convert to messages and count tokens
+        try:
+            messages = prompt_value.to_messages()
+            total_tokens = sum(_count_message_tokens(msg) for msg in messages)
+            print(f"Total tokens in prompt: {total_tokens}")
+        except Exception as e:
+            print(f"Error counting tokens: {str(e)}")
+            total_tokens = MAX_PROMPT_TOKENS + 1  # Force truncation as fallback
+
+        if total_tokens > MAX_PROMPT_TOKENS:
+            print(f"Truncating prompt from {total_tokens} to {MAX_PROMPT_TOKENS} tokens")
+            try:
+                # Calculate proportion to keep
+                keep_ratio = MAX_PROMPT_TOKENS / total_tokens
+                # Truncate the last message (usually the observation)
+                last_message = messages[-1]
+                if isinstance(last_message.content, str):
+                    truncated_content = last_message.content[:int(len(last_message.content) * keep_ratio)]
+                    messages[-1] = HumanMessage(content=truncated_content)
+                response = llm.invoke(messages)
+            except Exception as e:
+                print(f"Error during truncation and LLM call: {str(e)}")
+                raise
+        else:
+            try:
+                response = llm.invoke(prompt_value)
+            except Exception as e:
+                print(f"Error during LLM call: {str(e)}")
+                raise
+
+        action = response.content
+        return {"action": action}
+    except Exception as e:
+        print(f"Critical error in llm_call_node: {str(e)}")
+        raise
 
 
 
@@ -405,7 +553,7 @@ def tool_router(state: AgentState):
     action = state["action"]["action"]
     action_type = action.split(" ")[0]
     if action_type == "retry":
-        return "annotate_page"
+        return "mark_page"
     if action_type == "Respond":
         return "answer_node"
     return tools[action_type]
@@ -609,9 +757,22 @@ async def go_to_search_engine(state: AgentState):
     return {"last_action": "Go to Search Engine : Navigated to Google", "actions_taken": ["Go to Search Engine : Navigated to Google"]}
 
 
+async def control_image_processing(state: AgentState):
+    action = state["action"]["action"]
+    page = state["page"]
+    use_vision = state["use_vision"]
+    
+    # Disable images for text-heavy operations
+    if "extract" in action.lower() or "text" in action.lower():
+        return {"use_vision": False}
+    else:
+        return {"use_vision": True}
+
+
 builder = StateGraph(AgentState)
 
-builder.add_node("annotate_page", annotate_page)
+builder.add_node("control_image_processing", control_image_processing)
+builder.add_node("mark_page", mark_page)
 builder.add_node("llm_call", llm_call_node)
 builder.add_node("parse_action", parse_action_node)
 builder.add_node("master_plan_node", master_plan_node)
@@ -624,16 +785,18 @@ builder.add_node("go_to_search_engine", go_to_search_engine)
 builder.add_node("answer_node", answer_node)
 
 builder.add_edge(START, "master_plan_node")
-builder.add_edge("master_plan_node", "annotate_page")
-builder.add_edge("annotate_page", "llm_call")
+builder.add_edge("master_plan_node", "control_image_processing")
+builder.add_edge("control_image_processing", "mark_page")
+builder.add_edge("mark_page", "llm_call")
 builder.add_edge("llm_call", "parse_action")
-builder.add_conditional_edges("parse_action", tool_router, ["annotate_page",  "click", "type", "scroll", "wait", "go_back", "go_to_search_engine", "answer_node"])
-builder.add_edge("click", "annotate_page")
-builder.add_edge("type", "annotate_page")
-builder.add_edge("scroll", "annotate_page")
-builder.add_edge("wait", "annotate_page")
-builder.add_edge("go_back", "annotate_page")
-builder.add_edge("go_to_search_engine", "annotate_page")
+builder.add_conditional_edges("parse_action", tool_router, ["mark_page",  "click", "type", "scroll", "wait", "go_back", "go_to_search_engine", "answer_node"])
+builder.add_edge("click", "mark_page")
+builder.add_edge("type", "mark_page")
+builder.add_edge("scroll", "mark_page")
+builder.add_edge("wait", "mark_page")
+builder.add_edge("go_back", "mark_page")
+builder.add_edge("go_to_search_engine", "mark_page")
 builder.add_edge("answer_node", END)
 
 main_agent_graph = builder.compile()
+
